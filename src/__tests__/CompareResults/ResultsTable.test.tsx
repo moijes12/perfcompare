@@ -6,7 +6,10 @@ import userEvent, { type UserEvent } from '@testing-library/user-event';
 import { loader } from '../../components/CompareResults/loader';
 import ResultsView from '../../components/CompareResults/ResultsView';
 import { Strings } from '../../resources/Strings';
-import type { CombinedResultsItemType } from '../../types/state';
+import type {
+  CombinedResultsItemType,
+  CompareResultsItem,
+} from '../../types/state';
 import type { Platform, TestVersion } from '../../types/types';
 import getTestData, {
   augmentCompareDataWithSeveralTests,
@@ -14,6 +17,7 @@ import getTestData, {
   augmentCompareMannWhitneyDataWithSeveralRevisions,
   augmentCompareMannWhitneyDataWithSeveralTests,
 } from '../utils/fixtures';
+import { recreateStore } from '../utils/setupTests';
 import {
   renderWithRouter,
   screen,
@@ -22,12 +26,19 @@ import {
   enableAdvancedColumns,
 } from '../utils/test-utils';
 
+const ROUTE = '/compare-results/';
+
+function searchFor(extraParameters?: string) {
+  return (
+    '?baseRev=spam&baseRepo=try&framework=1' +
+    (extraParameters ? '&' + extraParameters : '')
+  );
+}
+
 function renderWithRoute(component: ReactElement, extraParameters?: string) {
   return renderWithRouter(component, {
-    route: '/compare-results/',
-    search:
-      '?baseRev=spam&baseRepo=try&framework=1' +
-      (extraParameters ? '&' + extraParameters : ''),
+    route: ROUTE,
+    search: searchFor(extraParameters),
     loader,
   });
 }
@@ -51,6 +62,17 @@ function setupAndRender(
   );
 }
 
+// Like setupAndRender, but simulates a full page load (reload or opening a
+// shared link): the store is created after the URL is set, as in the app.
+function setupAndRenderAsPageLoad(
+  testCompareData: CombinedResultsItemType[],
+  extraParameters?: string,
+) {
+  window.history.replaceState(null, '', ROUTE + searchFor(extraParameters));
+  recreateStore();
+  setupAndRender(testCompareData, extraParameters);
+}
+
 // This handy function parses the results page and returns an array of visible
 // rows. It makes it easy to assert visible rows when filtering them in a
 // user-friendly way without using snapshots.
@@ -63,12 +85,14 @@ function summarizeVisibleRows(testVersion?: TestVersion, advanced = false) {
     const optionsElements = Array.from(
       titleElement.nextElementSibling!.children,
     );
-    // The "better direction" indicator is asserted separately (and via
-    // snapshots); strip it here so the data-focused expectations stay stable.
+    // The "better direction" indicator and the framework name are asserted
+    // separately (and via snapshots); strip them here so the data-focused
+    // expectations stay stable.
     const titleClone = titleElement.cloneNode(true) as HTMLElement;
     titleClone
       .querySelector('[data-testid="better-direction-indicator"]')
       ?.remove();
+    titleClone.querySelector('[data-testid="framework-name"]')?.remove();
     const title = [
       titleClone.textContent,
       ...optionsElements.map((element) => element.textContent),
@@ -231,6 +255,26 @@ describe('Results Table', () => {
       '  - macOS 10.15, Improvement, 1.08 %, Low',
     ]);
     expect(screen.getByRole('rowgroup')).toMatchSnapshot();
+  });
+
+  it('should render a separate block per framework', async () => {
+    const { testCompareData } = getTestData();
+    const browsertimeResults = testCompareData.map(
+      (result): CompareResultsItem => ({
+        ...result,
+        framework_id: 13,
+      }),
+    );
+
+    setupAndRender([...testCompareData, ...browsertimeResults]);
+
+    await screen.findAllByText('a11yr');
+    expect(
+      screen
+        .getAllByTestId('framework-name')
+        .map((element) => element.textContent),
+    ).toEqual(['- talos', '- browsertime']);
+    expect(screen.getAllByRole('rowgroup')).toHaveLength(2);
   });
 
   it('should filter on the Platform column', async () => {
@@ -1365,6 +1409,66 @@ describe('Advanced-columns toggle for mann-whitney-u testVersion', () => {
     expect(advancedParam()).toBeNull();
   });
 
+  it('restores the Significance filter from the URL on page load', async () => {
+    const { testCompareMannWhitneyData } = getTestData();
+    setupAndRenderAsPageLoad(
+      testCompareMannWhitneyData,
+      'test_version=mann-whitney-u&advanced_columns=significance&filter_significance=significant&initialized=1',
+    );
+    await screen.findByText('a11yr');
+
+    expect(summarizeVisibleRows('mann-whitney-u')).toEqual([
+      'a11yr dhtml.html spam opt e10s fission stylo webrender',
+      '  - Windows 10, -, , -, Real',
+      '  - Windows 10, -2.40%, , -, Real',
+    ]);
+    const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime });
+    expect(await summarizeTableFiltersFromCheckboxes(user)).toMatchObject({
+      'Significance(1)': ['Real'],
+    });
+    expect(summarizeTableFiltersFromUrl()).toEqual({
+      significance: ['significant'],
+    });
+  });
+
+  it('restores the Significance sort from the URL on page load', async () => {
+    const { testCompareMannWhitneyData } = getTestData();
+    setupAndRenderAsPageLoad(
+      testCompareMannWhitneyData,
+      'test_version=mann-whitney-u&advanced_columns=significance&sort=significance|asc&initialized=1',
+    );
+    await screen.findByText('a11yr');
+
+    expect(
+      screen.getByRole('button', {
+        name: /Significance.*Currently sorted by this column/,
+      }),
+    ).toBeInTheDocument();
+    // Ascending p-value: the significant ("Real") rows come first.
+    expect(summarizeVisibleRows('mann-whitney-u')).toEqual([
+      'a11yr dhtml.html spam opt e10s fission stylo webrender',
+      '  - Windows 10, -2.40%, , -, Real',
+      '  - Windows 10, -, , -, Real',
+      '  - macOS 10.15, +1.08%, Improvement, -, Noise',
+      '  - Linux 18.04, +1.85%, Regression, Negligible, Noise',
+    ]);
+    expectParameterToHaveValue('sort', 'significance|asc');
+  });
+
+  it('ignores a Significance filter in the URL when the column is hidden', async () => {
+    const { testCompareMannWhitneyData } = getTestData();
+    setupAndRenderAsPageLoad(
+      testCompareMannWhitneyData,
+      'test_version=mann-whitney-u&filter_significance=significant&initialized=1',
+    );
+    await screen.findByText('a11yr');
+
+    const header = screen.getByTestId('table-header');
+    expect(header.querySelector('.significance-header')).toBeFalsy();
+    // All four rows are still shown.
+    expect(summarizeVisibleRows('mann-whitney-u')).toHaveLength(5);
+  });
+
   it('groups the dropdown into Advanced Columns and Advanced expanded row details sections', async () => {
     const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime });
     const { testCompareMannWhitneyData } = getTestData();
@@ -1574,5 +1678,42 @@ describe('cookie persistence vs. shareable URLs', () => {
       expect(params.get('initialized')).toBe('1');
       expect(params.get('filter_status')).toBe('regression');
     });
+  });
+});
+
+// Placed at the end of the file on purpose: this test performs extra renders /
+// menu interactions, and React's useId counter is global across renders in a
+// jest run, so running it before the snapshot tests above would shift their
+// generated ids. Keeping it last avoids perturbing those snapshots.
+describe('Filtered-rows notice', () => {
+  it('shows how many rows the active filters hide, and why', async () => {
+    const { testCompareData } = getTestData();
+    setupAndRender(testCompareData, 'test_version=student-t');
+
+    await screen.findByText('a11yr');
+    // No active filters → no notice.
+    expect(
+      screen.queryByTestId('filtered-rows-notice'),
+    ).not.toBeInTheDocument();
+
+    const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime });
+
+    // Hide the two "No changes" rows; the notice reports the count and reason.
+    await clickMenuItem(user, 'Status', /No changes/);
+    const notice = await screen.findByTestId('filtered-rows-notice');
+    expect(notice).toHaveTextContent('2 rows hidden by filters');
+    expect(notice).toHaveTextContent('Status: No changes');
+
+    // Narrowing to a single status hides more rows and the count updates.
+    await clickMenuItem(user, 'Status', /Select only.*Regression/);
+    expect(await screen.findByTestId('filtered-rows-notice')).toHaveTextContent(
+      '3 rows hidden by filters',
+    );
+
+    // Clearing the filter removes the notice again.
+    await clickMenuItem(user, 'Status', /Select all values/);
+    expect(
+      screen.queryByTestId('filtered-rows-notice'),
+    ).not.toBeInTheDocument();
   });
 });
